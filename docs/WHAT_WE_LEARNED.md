@@ -34,7 +34,7 @@ WV629's F1–F13 — those belong to their authors.
   refused unconditionally for an empty channel.
 - **Source:** SPIKE.md §2.2, first end-to-end attempt.
 
-## 4. A native SDK turn cannot survive the Pollinations free tier (HTTP 402)
+## 4. A native SDK turn cannot survive the Pollinations free tier (HTTP 402) — for structured work; the draft step works
 
 - **Reproduce:** `Agent.run` against `https://text.pollinations.ai/openai/v1`
   with `model="openai"`, three attempts on 2026-11-17, all fail in the
@@ -52,10 +52,34 @@ WV629's F1–F13 — those belong to their authors.
   `AgentOutputValidationError`. So the native path is unreliable in two
   different ways on the free tier, not one. (Recorded as a run observation
   from our own probe runs; not claimed as a new SDK bug.)
-- **Impact:** the production path is the direct HTTP client (one call per
-  step, paced ≥45 s). The probe suite re-attempts one native turn per full
-  run and records the outcome honestly instead of claiming a pass.
-- **Source:** SPIKE.md §4; `probe_tool_calls` (SDK half).
+- **Round 2–3 (2026-11-17, counting proxy on 127.0.0.1:8471):** with
+  `output_type=TriageVerdict` the turn's provider calls DO go through
+  (4 calls, all 200, ~77 s) but the model returns partial JSON and the
+  SDK's strict coercion rejects it; with `output_type=None` the raw reply
+  is `triage: {"issue_id":778,"status":"open","classification":"bug",
+  "suggested_labels":[...],"assignee":null}` — the model invents its own
+  field names despite an explicit full-schema contract, and a same-session
+  follow-up asking for the missing fields returns **all nulls**. The SDK
+  has no `response_format` / `json_object` support anywhere in its
+  provider layer, so structured classify through `Agent.run` is not
+  reliable on this tier. **The draft step works through the SDK:**
+  `Agent.run` with `output_type=None` returned
+  `triage: {"answer": "Thanks for reporting issue #778. I've triaged it
+  as a high-severity bug in the brain module ...", "freshness": {...}}`
+  in 65.6 s — the draft text is correct, inside the SDK's internal
+  `{"answer": ...}` envelope. `sdk_triage.parse_sdk_draft` understands
+  the `answer` envelope, a `{"draft": ...}` object, and plain prose.
+- **Impact:** classify stays on the direct HTTP client (one call per step,
+  paced ≥45 s, tool_calls + `response_format=json_object`); the draft
+  step runs through a real `Agent.run` turn behind `triage --via-sdk`
+  (falling back to the direct draft if the SDK turn yields no usable
+  draft). The probe suite re-attempts native turns per full run and
+  records the outcome honestly instead of claiming a pass; the new
+  `sdk_native_draft` probe covers the working path.
+- **Source:** SPIKE.md §4; `probe_tool_calls` (SDK half);
+  `/tmp/sdk_round2.log`, `/tmp/sdk_round2_attempt{1,2,3}.json`,
+  `/tmp/sdk_round3_classify.json`, `/tmp/sdk_round3_draft.json`;
+  `src/issue_triage/sdk_triage.py`; probe `sdk_native_draft`.
 
 ## 5. Retry backoff is hardcoded to 300 ms and ignores `Retry-After` (new)
 
@@ -160,6 +184,10 @@ WV629's F1–F13 — those belong to their authors.
   bypasses the constrained-decoding path. The probe runner records a
   per-probe failure instead of aborting the whole suite (and still writes
   `BUILDING_BLOCKS_TESTED.md`).
+- **Update 2026-11-17:** the same 400 hit two *classify* calls in the
+  label-blind eval (#777, #773) despite the slim-prompt retry — so it is
+  not draft-specific, and a shape-changing retry does not always escape
+  it. The eval records those issues as errors and continues.
 - **Source:** `/tmp/probe_full.log` (run 1), `/tmp/probe_full2.log` (run 2,
   two 400s at 17:49:13/17:49:58, same body timestamp), `scripts/ab_reasoning_effort.py`;
   `src/issue_triage/triage.py::draft`, `src/issue_triage/probe.py::run_probes`.
@@ -193,3 +221,146 @@ WV629's F1–F13 — those belong to their authors.
   of fixed overhead even for tiny prompts (SPIKE.md §3.1: 333 prompt tokens
   for a ~30-token prompt) — budget by the metered number, not the prompt.
 - **Source:** live triage + eval runs, 2026-11-17; `eval/results-*.json`.
+
+## 13. The 0.9 eval accuracy was label-aware, not independent classification
+
+- **The leak:** the classifier prompt included the issue's existing
+  maintainer labels (`"Existing labels: bug"` — while asking whether the
+  issue is a bug), and the eval used those same labels as ground truth.
+  The reported accuracy 0.9 (10 real openminion issues, 2026-11-16) is a
+  real measured agreement, but it measures label-copying as much as
+  classification. The #778 claim ("verdict exactly matches the
+  maintainer's actual labels") has the same limitation: the prompt showed
+  the model those labels.
+- **Fix:** `eval` is now label-blind by default (`--label-aware` restores
+  the old leaky mode for comparison). In blind mode the prompt renders
+  `"Existing labels: (hidden — evaluation mode; classify from the issue
+  text only)"`; the repo label list stays (closed-vocabulary validation
+  is legitimate — it constrains the answer space, it is not the answer).
+  The result file records `"mode": "label-blind" | "label-aware"`.
+  Production triage still shows existing labels (a human reviews them;
+  only eval hides them).
+- **Numbers:** label-aware baseline 0.9 (n=10; bug P 0.857 / R 1.0,
+  feature P 1.0 / R 0.75; file `eval/results-20261116-1739.json`).
+  Label-blind rerun 2026-11-17: **accuracy 1.0 (10/10)** — bug P 1.0 /
+  R 1.0 (support 8), feature P 1.0 / R 1.0 (support 2); confidence
+  ≥0.8 6/6, 0.5–0.8 4/4 (file `eval/results-20261116-2141.json`, 18.4 min
+  wall clock). Hiding the labels did not hurt accuracy. Caveats: n=10
+  each; the two runs scored partly different issue sets (blind set:
+  780, 779, 778, 774, 770, 769, 766, 759, 757, 754); 3 further issues
+  errored and were excluded (#777, #773: the `<|constrain|>commentary`
+  HTTP 400 — this time on the classify call, despite the slim-prompt
+  retry; #767: the model answered `enhancement` as the issue type, an
+  invalid enum value). #778 blind: bug at confidence 0.90 (label-aware:
+  0.80) — the *type* classification holds without the labels; the full
+  "labels exactly match the maintainer's" claim stays label-aware-only.
+- **Source:** `src/issue_triage/triage.py::_classifier_messages`
+  (`hide_existing_labels`), `src/issue_triage/eval.py::run_eval`
+  (`blind=True` default); `tests/test_triage.py`, `tests/test_eval.py`.
+
+## 14. A tokenless `approve --yes` bricked the snapshot it was meant to run
+
+- **Reproduce:** `approve --yes` without `GITHUB_TOKEN` called
+  `store.approve_once()` (pending → approved, refuses non-pending)
+  *before* checking the token. It printed "re-run with a token to
+  execute" — but that re-run failed at `approve_once` with
+  `NotPendingError`, because the snapshot was already "approved". One
+  tokenless approve made the snapshot unexecutable.
+- **Fix:** the token is now checked *before* any state change. A tokenless
+  `--yes` prints the exact `gh api` commands and leaves the snapshot
+  pending, so a later token-bearing run works. A token-bearing run on a
+  snapshot stranded in "approved" by the old bug resumes straight to
+  execution instead of refusing it. Write failures mid-execution leave
+  the snapshot "approved" for retry, and a comment-dedup guard
+  (`GitHubClient.find_comment`, exact-body match over the last 100
+  comments) prevents double-posting if the process dies between the post
+  and the consume.
+- **Source:** `src/issue_triage/cli.py` (approve command),
+  `src/issue_triage/approval.py`, `src/issue_triage/github_client.py::find_comment`;
+  regression tests in `tests/test_approve_cli.py` (tokenless leaves
+  pending; tokenless → token consumes; stranded approved resumes;
+  partial-write stays approved then retries with exactly one comment).
+
+## 15. The SDK turn's reply is prefixed and enveloped — and its 400s are non-fatal
+
+- **The prefix:** every raw `Agent.run` reply in rounds 1–3 arrived as
+  `triage: {...}` — including the draft turn, where the agent was
+  constructed with `name="draft"`. The prefix is therefore not the
+  `Agent` name; it matches the runtime's agent-profile name
+  (`build_isolated_runtime` registers a profile called `"triage"`).
+  The raw provider response (counting proxy) carries no prefix, so the
+  prefix is introduced by the SDK turn loop. Consequence: the SDK's own
+  typed coercion (`output_type=TriageVerdict`) rejects its own prefixed
+  reply — a genuine SDK rough edge worth reporting upstream, recorded
+  here as an observation, not a claim.
+- **The envelope:** the draft turn's reply is the SDK's internal shape,
+  `{"answer": "<draft text>", "freshness": {...}}`, not the requested
+  `{"draft": ..., "tone": ...}`. The internal freshness/intent
+  classification rounds leak into the final answer. `parse_sdk_draft`
+  extracts the `answer` field (and also accepts a `{"draft": ...}`
+  object and plain prose).
+- **The 400s are non-fatal:** in every round-2/3 turn, one internal round
+  sent `<|constrain|>commentary` tokens and got HTTP 400 (the cached
+  upstream error from §12, byte-identical body, same timestamp). The SDK
+  retried it 3× within ~2 s (useless — same cached 400), yet the turn
+  still completed and produced its final answer. The 400 kills one
+  internal round, not the turn.
+- **CLI runs are 0/2 native (2026-11-17 21:42, 21:44 UTC):** two live
+  `triage --via-sdk` runs on #778 both failed the SDK draft turn the same
+  way (first call 200, then 9× 402; the fallback to the direct draft
+  worked both times, verdict bug / needs-maintainer / confidence 0.95,
+  snapshot saved pending). The pattern across all evidence: the turn
+  completes only when its early internal rounds fail with the
+  non-quota-consuming 400 glitch instead of returning 200s — i.e. a free-tier SDK turn currently succeeds only while the upstream glitch is
+  active. No pacing wait in the CLI can fix this: the turn fires its
+  calls ~1 s apart and needs more than one 200 inside a 45 s window.
+  That is why `--via-sdk` is best-effort with a fallback, not the
+  default path.
+- **Source:** `/tmp/sdk_round2.log`, `/tmp/sdk_round3_classify.json`,
+  `/tmp/sdk_round3_draft.json`, `/tmp/sdk_proxy_log.jsonl`;
+  `src/issue_triage/sdk_triage.py::strip_sdk_prefix`,
+  `::parse_sdk_draft`.
+
+## 16. Linked PRs were numbers only; now their titles and bodies are fetched
+
+- **The gap:** `github_client.py` extracted linked PR numbers from the
+  timeline (`linked_pr_numbers`) but never fetched PR contents, while
+  the README implied the triage read them.
+- **Fix:** `GitHubClient.get_pull_summary` (pulls endpoint; 404/403 →
+  `None`) and `IssueContext.linked_pr_details`; `fetch_context(...,
+  fetch_linked_prs=True)` fetches up to 2 PR summaries, each body
+  truncated to 400 chars in the prompt. The eval path passes
+  `fetch_linked_prs=False` so the blind rerun's prompt matches the
+  baseline run except for the hidden labels (and stays inside the
+  unauthenticated GitHub 60 req/hour cap).
+- **Source:** `src/issue_triage/github_client.py::get_pull_summary`,
+  `src/issue_triage/triage.py::fetch_context`; tests in
+  `tests/test_triage.py` (PR details in prompt, no-PR-fetch, stub serves
+  `/pulls/770`).
+
+## 17. The browser preview is now in the repo, hardened
+
+- **The gap:** the try-out page lived only as a hosted artifact; the repo
+  had no HTML/JS and the README documented no browser entry point.
+- **Fix:** the built page source is committed as
+  `docs/browser-preview/index.html` (exported from the artifact, then
+  hardened), with launch instructions in `docs/browser-preview/README.md`
+  and a smoke test in `scripts/smoke_browser_preview.py`.
+- **Hardening (per the ChatGPT audit, verified live 2026-11-17):**
+  `response_format: {type: "json_object"}` on the triage call only (the
+  brief call stays prose; Pollinations accepts the field — verified by
+  curl, 9.2 s, clean `{"a": 1}`); 105 s per-attempt timeout (was 90 s);
+  the `tool_calls` + `content` envelope is parsed (some free-tier replies
+  come back as a tool call); one bounded auto-retry on 402 after
+  `max(47 s, Retry-After)` with a visible countdown, then a manual retry;
+  the 45 s cooldown is remembered in `localStorage` across refreshes and
+  tabs; the Start button stays disabled while a call is in flight;
+  suggested labels are validated against the repo's real 31-label list
+  (from `fixtures/openminion-issue-778.json`) exactly like the CLI does,
+  and drops are shown; enum values and the 0–1 confidence range are
+  validated the same way. The page is labelled a simplified one-call
+  preview (classify only — no comments / linked PRs / CODEOWNERS /
+  memory / approval gate / draft), not the full two-step CLI pipeline.
+- **Source:** `docs/browser-preview/index.html`,
+  `scripts/smoke_browser_preview.py` (static checks + a `--live`
+  1-call check).

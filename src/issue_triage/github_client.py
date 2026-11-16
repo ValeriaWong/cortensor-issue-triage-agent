@@ -108,6 +108,26 @@ class GitHubClient:
         resp.raise_for_status()
         return resp.json()
 
+    def get_pull_summary(self, repo: str, number: int) -> dict[str, Any] | None:
+        """Title/body/state of a linked PR, or None if it cannot be read.
+
+        The classifier used to see only linked PR *numbers* ("Linked PRs:
+        #770"), which say nothing. A title + body snippet is real evidence.
+        """
+        owner, name = parse_repo(repo)
+        resp = self._client.get(f"/repos/{owner}/{name}/pulls/{number}")
+        if resp.status_code in (404, 403):
+            return None
+        resp.raise_for_status()
+        data = resp.json()
+        return {
+            "number": number,
+            "title": data.get("title") or "",
+            "body": data.get("body") or "",
+            "state": data.get("state") or "",
+            "merged": bool(data.get("merged")),
+        }
+
     def list_labels(self, repo: str) -> list[str]:
         owner, name = parse_repo(repo)
         resp = self._client.get(f"/repos/{owner}/{name}/labels", params={"per_page": 100})
@@ -149,6 +169,16 @@ class GitHubClient:
                 content = base64.b64decode(content).decode("utf-8", "replace")
             return parse_codeowners(content)
         return []
+
+    def find_comment(self, repo: str, number: int, body: str) -> dict[str, Any] | None:
+        """Return the first comment on the issue whose body matches exactly,
+        or None. Crash-safety for the approval path: if a previous execute
+        attempt posted the comment but died before consuming the snapshot,
+        the retry must not post it a second time."""
+        for comment in self.list_comments(repo, number, per_page=100):
+            if (comment.get("body") or "").strip() == body.strip():
+                return comment
+        return None
 
     # -- writes (approval-gated only) -----------------------------------
     def _require_token(self) -> None:

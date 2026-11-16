@@ -15,7 +15,7 @@ from typing import Optional
 
 import typer
 
-from .approval import AlreadyConsumedError, NotPendingError, SnapshotStore
+from .approval import AlreadyConsumedError, NotPendingError, SnapshotError, SnapshotStore
 from .config import (
     fix_proxy_env,
     github_token,
@@ -73,6 +73,11 @@ def _print_verdict(result: dict) -> None:
                f"draft: {result['draft_meta']['channel']}, "
                f"{result['draft_meta']['latency_ms']} ms; "
                f"total {result['total_ms']} ms]")
+    typer.echo(f"   [classify via: {result.get('classify_via', 'direct')}; "
+               f"draft via: {result.get('draft_via', 'direct')}]")
+    if result["draft_meta"].get("sdk_error"):
+        typer.echo(f"   [sdk draft failed, fell back to direct: "
+                   f"{result['draft_meta']['sdk_error']}]")
     typer.echo("\n-- draft reply (NOT sent) --")
     typer.echo(draft.draft)
 
@@ -85,6 +90,14 @@ def triage(
     limit: Optional[int] = typer.Option(None, "--limit", help="batch: triage N open issues"),
     fixture: Optional[str] = typer.Option(None, "--fixture", help="local raw issue JSON file"),
     preset: Optional[str] = typer.Option(None, "--preset", help="provider preset"),
+    via_sdk: bool = typer.Option(
+        False, "--via-sdk",
+        help="draft via a real OpenMinion Agent.run turn (classify stays on "
+             "the paced direct client — the SDK has no response_format "
+             "support, so the free model free-forms classify JSON; see "
+             "docs/WHAT_WE_LEARNED.md). Falls back to the direct draft if "
+             "the SDK turn yields no usable draft.",
+    ),
 ) -> None:
     """Deep-triage one issue (or, with --limit, N open issues as a batch)."""
     if issue_url:
@@ -104,6 +117,7 @@ def triage(
     llm, gh, memory = _setup(preset)
     engine = TriageEngine(llm=llm, github=gh, memory=memory)
     store = SnapshotStore()
+    provider = resolve_provider(preset) if via_sdk else None
     try:
         if limit is not None:
             if not repo:
@@ -116,7 +130,7 @@ def triage(
             repo_cache = engine.fetch_repo_cache(repo)
             for item in issues:
                 ctx = engine.fetch_context(repo, item["number"], repo_cache=repo_cache)
-                result = engine.run(ctx)
+                result = engine.run(ctx, via_sdk=via_sdk, provider=provider)
                 _print_verdict(result)
                 snap = _save_snapshot(store, result)
                 typer.echo(f"   [snapshot: {snap.id} (pending)]")
@@ -126,7 +140,7 @@ def triage(
             ctx = TriageEngine.context_from_fixture(repo, raw)
         else:
             ctx = engine.fetch_context(repo, issue)
-        result = engine.run(ctx)
+        result = engine.run(ctx, via_sdk=via_sdk, provider=provider)
         _print_verdict(result)
         snap = _save_snapshot(store, result)
         typer.echo(f"\n[snapshot saved: {snap.id} — pending approval]")
@@ -145,9 +159,25 @@ def _save_snapshot(store: SnapshotStore, result: dict) -> Snapshot:
         issue_title=result["title"],
         verdict=result["verdict"],
         draft=result["draft"],
+        note=f"classify via {result.get('classify_via', 'direct')}; "
+             f"draft via {result.get('draft_via', 'direct')}",
     )
     store.save(snap)
     return snap
+
+
+def _print_gh_commands(snap: Snapshot) -> None:
+    """Print the exact gh commands a human can run for this snapshot."""
+    if snap.verdict.suggested_labels:
+        typer.echo(
+            f"  gh api repos/{snap.repo}/issues/{snap.issue_number}/labels "
+            f"-f 'labels[]={snap.verdict.suggested_labels[0]}'"
+            + "".join(f" -f 'labels[]={l}'" for l in snap.verdict.suggested_labels[1:])
+        )
+    typer.echo(
+        f"  gh api repos/{snap.repo}/issues/{snap.issue_number}/comments "
+        f"-f body=@- <<'EOF'\n{snap.draft.draft}\nEOF"
+    )
 
 
 @app.command()
@@ -166,43 +196,63 @@ def approve(
     store = SnapshotStore()
     memory = RepoMemory()
     if no:
-        snap = store.reject(snapshot, note=note)
+        try:
+            snap = store.reject(snapshot, note=note)
+        except (NotPendingError, SnapshotError) as exc:
+            typer.echo(f"error: {exc}", err=True)
+            raise typer.Exit(1)
         typer.echo(f"rejected snapshot {snap.id} (issue #{snap.issue_number}); nothing was sent.")
         return
-    # --yes: approve, then execute exactly once
+    # --yes: the token is checked BEFORE any state change. A tokenless run
+    # must not move the snapshot out of "pending": approve_once refuses
+    # non-pending snapshots, so a tokenless approve used to brick the
+    # snapshot for the later token-bearing run (fixed 2026-11-17).
     try:
-        snap = store.approve_once(snapshot)
-    except NotPendingError as exc:
+        snap = store.load(snapshot)
+    except SnapshotError as exc:
         typer.echo(f"error: {exc}", err=True)
+        raise typer.Exit(1)
+    if snap.status in ("consumed", "rejected"):
+        typer.echo(f"error: snapshot {snap.id} is {snap.status}; refusing", err=True)
         raise typer.Exit(1)
     token = github_token()
     if not token:
         typer.echo("No GITHUB_TOKEN: nothing was executed. Run these yourself:")
-        if snap.verdict.suggested_labels:
-            typer.echo(
-                f"  gh api repos/{snap.repo}/issues/{snap.issue_number}/labels "
-                f"-f 'labels[]={snap.verdict.suggested_labels[0]}'"
-                + "".join(f" -f 'labels[]={l}'" for l in snap.verdict.suggested_labels[1:])
-            )
-        typer.echo(
-            f"  gh api repos/{snap.repo}/issues/{snap.issue_number}/comments "
-            f"-f body=@- <<'EOF'\n{snap.draft.draft}\nEOF"
-        )
-        typer.echo(f"\nSnapshot {snap.id} stays 'approved' (not consumed) — re-run with a "
-                   "token to execute, or reject it with --no.")
+        _print_gh_commands(snap)
+        typer.echo(f"\nSnapshot {snap.id} stays '{snap.status}' (not consumed) — "
+                   "re-run with GITHUB_TOKEN to execute, or reject it with --no.")
         return
+    # With a token: approve if still pending, then write once, then consume.
+    # A snapshot stranded in "approved" (e.g. by the old tokenless path)
+    # resumes straight to execution instead of being refused.
+    if snap.status == "pending":
+        try:
+            snap = store.approve_once(snapshot)
+        except NotPendingError as exc:
+            typer.echo(f"error: {exc}", err=True)
+            raise typer.Exit(1)
     gh = GitHubClient(token=token)
     try:
         if snap.verdict.suggested_labels:
             applied = gh.apply_labels(snap.repo, snap.issue_number, snap.verdict.suggested_labels)
             typer.echo(f"labels applied: {', '.join(applied)}")
-        comment = gh.post_comment(snap.repo, snap.issue_number, snap.draft.draft)
-        typer.echo(f"comment posted: {comment.get('html_url', '')}")
+        # Crash-safety: if a previous attempt posted the comment but died
+        # before consuming, do not post it a second time.
+        if gh.find_comment(snap.repo, snap.issue_number, snap.draft.draft) is not None:
+            typer.echo("comment already present — skipping post (retry after crash?)")
+        else:
+            comment = gh.post_comment(snap.repo, snap.issue_number, snap.draft.draft)
+            typer.echo(f"comment posted: {comment.get('html_url', '')}")
         store.consume(snap.id)
         memory.mark_decided(snap.repo, snap.issue_number)
         typer.echo(f"snapshot {snap.id} consumed (single use — a second approve is refused).")
     except AlreadyConsumedError as exc:
         typer.echo(f"error: {exc}", err=True)
+        raise typer.Exit(1)
+    except Exception as exc:  # noqa: BLE001 - write failed midway; stay approved for retry
+        typer.echo(f"error: write failed ({type(exc).__name__}: {exc}); "
+                   f"snapshot {snap.id} stays 'approved' — fix the cause and re-run.",
+                   err=True)
         raise typer.Exit(1)
     finally:
         gh.close()
@@ -246,16 +296,25 @@ def eval_cmd(
     repo: str = typer.Option("openminion/openminion", "--repo", help="owner/name"),
     limit: int = typer.Option(10, "--limit", help="issues to evaluate"),
     preset: Optional[str] = typer.Option(None, "--preset", help="provider preset"),
+    label_aware: bool = typer.Option(
+        False, "--label-aware",
+        help="show each issue's maintainer labels to the classifier (the old, "
+             "leaky baseline). Default is label-blind: labels hidden, the "
+             "honest accuracy.",
+    ),
 ) -> None:
     """Evaluate the classifier on N real labelled issues (ground truth =
-    maintainer labels). One model call per issue, paced >=45 s."""
+    maintainer labels). One model call per issue, paced >=45 s. Default
+    mode is label-blind: the issue's existing labels are hidden from the
+    prompt, so the score measures classification, not label-copying."""
     parse_repo(repo)
     llm, gh, memory = _setup(preset)
     engine = TriageEngine(llm=llm, github=gh, memory=memory)
     try:
-        typer.echo(f"eval: {repo}, limit={limit} "
+        typer.echo(f"eval: {repo}, limit={limit}, "
+                   f"mode={'label-aware' if label_aware else 'label-blind'} "
                    f"(~{limit} model calls, paced >=45 s apart — allow ~{limit} min)")
-        result = run_eval(engine, repo, limit)
+        result = run_eval(engine, repo, limit, blind=not label_aware)
         path = save_eval_result(result)
         typer.echo(json.dumps(result["metrics"], indent=2))
         typer.echo(f"\nskipped (unlabelled/ambiguous): "

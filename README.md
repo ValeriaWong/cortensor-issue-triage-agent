@@ -52,10 +52,30 @@ issue-triage triage --repo openminion/openminion --limit 5
 
 # Zero-LLM-cost demo from the bundled fixture
 bash scripts/demo.sh
+
+# Draft via a real OpenMinion Agent.run turn (classify stays direct — see below)
+issue-triage triage --repo openminion/openminion --issue 778 --via-sdk
 ```
 
 `triage` prints the verdict + draft reply and saves a **pending snapshot**
 under `.issue-triage/pending/`. It never touches GitHub.
+
+## Browser preview
+
+The same triage, clickable in a browser — no install, no key:
+
+```bash
+python3 -m http.server 8000 --directory docs/browser-preview
+# open http://localhost:8000/index.html
+```
+
+`docs/browser-preview/index.html` is a single self-contained page (issue
+triage + paper deadlines + hackathon watch + the three Build texts). The
+triage tab is a **simplified one-call preview** — classify only, with the
+same model and prompt shape as the CLI; it does not fetch comments /
+linked PRs / CODEOWNERS, has no memory, and never posts anything. Full
+details and the smoke test (`scripts/smoke_browser_preview.py`) are in
+`docs/browser-preview/README.md`.
 
 ### Approve (the only write path)
 
@@ -68,8 +88,12 @@ issue-triage approve --snapshot openminion-openminion-778-fbb60bfb --no
 ```
 
 Without `GITHUB_TOKEN`, `--yes` prints the exact `gh api` commands for a
-human to run instead of pretending it succeeded. An approved snapshot is
-**consumed once** — a second approve is refused (anti-replay).
+human to run instead of pretending it succeeded — and the snapshot stays
+**pending**, so a later token-bearing run still works (the token is
+checked *before* any state change). An approved snapshot is **consumed
+once** — a second approve is refused (anti-replay). A snapshot stranded
+in "approved" by the old tokenless bug resumes straight to execution
+instead of being refused.
 
 ## Architecture
 
@@ -77,8 +101,8 @@ human to run instead of pretending it succeeded. An approved snapshot is
 issue-triage triage --repo o/r --issue N
   │
   ├─ GitHub (public reads, no auth needed)
-  │   issue + comments + timeline (linked PRs) + repo labels
-  │   + CODEOWNERS + top contributors + past decisions for this repo
+  │   issue + comments + timeline (linked PRs: titles + bodies, up to 2)
+  │   + repo labels + CODEOWNERS + top contributors + past decisions
   │
   ├─ Classifier subagent ── 1 model call ──▶ TriageVerdict (Pydantic)
   │   type / severity / component / labels / assignee / route /
@@ -92,14 +116,24 @@ issue-triage triage --repo o/r --issue N
         └─ human approve ─▶ labels + comment posted once (or gh commands)
 ```
 
-**Why a direct HTTP client instead of SDK `Agent.run`:** one native SDK
-turn fires several consecutive model calls; on the Pollinations free tier
-(1 reply / 45 s / IP, HTTP 402) the first call consumes the quota and the
-rest fail, and the SDK's retry backoff is hardcoded to 300 ms and ignores
-`Retry-After` (see `docs/WHAT_WE_LEARNED.md` §5). The direct client makes
-exactly one call per step, paces calls ≥45 s apart, honours `Retry-After`,
-and parses answers through two channels — `tool_calls` first, plain-text
-JSON second — both validated by the same Pydantic model.
+**Why a direct HTTP client for classify, and SDK `Agent.run` for draft:**
+one native SDK turn fires several consecutive model calls; on the
+Pollinations free tier (1 reply / 45 s / IP, HTTP 402) the first call
+consumes the quota and the rest fail, and the SDK's retry backoff is
+hardcoded to 300 ms and ignores `Retry-After` (see
+`docs/WHAT_WE_LEARNED.md` §5). Worse, the SDK has no `response_format` /
+`json_object` support, so the free model free-forms its classify JSON —
+it invents its own field names and a same-session follow-up returns all
+nulls (measured 2026-11-17, §4). Classify therefore stays on the direct
+client: exactly one call per step, paced ≥45 s apart, honouring
+`Retry-After`, parsing answers through two channels — `tool_calls` first,
+plain-text JSON second — both validated by the same Pydantic model. The
+**draft** step does run through a real `Agent.run` turn
+(`triage --via-sdk`, `output_type=None`, raw reply parsed at the app
+level — the reply arrives as `triage: {"answer": ...}`); if that turn
+yields no usable draft it falls back to the direct draft, and the CLI
+prints which engine produced each part. The probe suite covers both
+sides (`tool_and_forced_tools`, `sdk_native_draft`).
 
 **Memory:** past decisions per repo live in `state/<owner>__<repo>.json`
 and are handed to the classifier as reference, so labels and routes stay
@@ -143,10 +177,33 @@ Overall **accuracy 0.9 (9/10)**, 0 errors, 0 skipped. The single miss
 (#777, `enhancement` predicted as `bug`) came with confidence 0.70 —
 the model was correctly unsure.
 
-Confidence calibration: mean confidence 0.839 on correct vs 0.70 on
-wrong; predictions with confidence ≥0.8 were 6/6 correct; 0.5–0.8 were
-3/4. High confidence means something here; low confidence is the signal
-to route to a human.
+**Read that 0.9 as the label-aware baseline, not independent accuracy:**
+the prompt showed the model each issue's existing maintainer labels
+while asking it to classify, and the eval scored against those same
+labels. `eval` is now **label-blind by default** — the prompt hides the
+existing labels (`eval --label-aware` restores the old mode for
+comparison) — and every result file records its `"mode"`. Both numbers
+are reported wherever the accuracy appears; see
+`docs/WHAT_WE_LEARNED.md` §13.
+
+Confidence calibration (label-aware run): mean confidence 0.839 on
+correct vs 0.70 on wrong; predictions with confidence ≥0.8 were 6/6
+correct; 0.5–0.8 were 3/4. High confidence means something here; low
+confidence is the signal to route to a human.
+
+Label-blind rerun, 2026-11-17, same repo, Pollinations `gpt-oss-20b`,
+$0 — evidence in `eval/results-20261116-2141.json` (18.4 min wall
+clock): **accuracy 1.0 (10/10)** — bug P 1.0 / R 1.0 (support 8),
+feature P 1.0 / R 1.0 (support 2); confidence ≥0.8 was 6/6, 0.5–0.8 was
+4/4. Hiding the labels did not hurt: the classifier reads the issue
+text, it was not copying labels. Caveats: small n (10 each), and the two
+runs scored partly different issue sets — the blind set is 780, 779, 778,
+774, 770, 769, 766, 759, 757, 754 (two issues are new since the baseline
+run); three further issues errored and were excluded from the 10 (#777,
+#773: the `<|constrain|>commentary` HTTP 400, despite the slim-prompt
+retry; #767: the model answered `enhancement` as the issue type, which
+is not a valid enum value). #778 blind: bug, confidence 0.90
+(label-aware: 0.80).
 
 Run a bigger batch with the same command and a larger `--limit`
 (30 issues ≈ 25 min, 50 ≈ 40 min, paced ≥45 s apart).
@@ -159,10 +216,12 @@ issue-triage probe --probe tool_and_forced_tools
 issue-triage probe --offline       # only the no-model probes
 ```
 
-10 probes, each run for real against the block it names. Statuses are
+11 probes, each run for real against the block it names. Statuses are
 `pass` / `partial` / `fail` — the SDK-native `Agent.run` probes are
 honestly marked `fail`/`partial` with the 402 evidence, not claimed as
-passes. See `docs/BUILDING_BLOCKS_TESTED.md` (auto-generated) and
+passes; the new `sdk_native_draft` probe covers the one SDK-native step
+that demonstrably works on the free tier (the draft turn). See
+`docs/BUILDING_BLOCKS_TESTED.md` (auto-generated) and
 `docs/WHAT_WE_LEARNED.md` (only findings we actually reproduced, with
 steps — including two new SDK rough edges: the hardcoded 300 ms retry
 backoff and the no-op public `import_bundle()`).
@@ -170,7 +229,7 @@ backoff and the no-op public `import_bundle()`).
 ## Tests
 
 ```bash
-.venv/bin/python -m pytest -q   # 81 tests, loopback HTTP stubs, zero LLM cost
+.venv/bin/python -m pytest -q   # 106 tests, loopback HTTP stubs, zero LLM cost
 ```
 
 Covers CLI parsing, verdict validation (illegal enum values rejected),
@@ -183,10 +242,13 @@ metrics.
 
 | Path | What it is |
 |---|---|
-| `src/issue_triage/` | the package (`cli`, `triage`, `llm_client`, `github_client`, `memory`, `approval`, `eval`, `probe`, `config`, `models`) |
-| `tests/` | 81 pytest tests (stubbed, $0) |
+| `src/issue_triage/` | the package (`cli`, `triage`, `sdk_triage`, `llm_client`, `github_client`, `memory`, `approval`, `eval`, `probe`, `config`, `models`) |
+| `tests/` | 106 pytest tests (stubbed, $0) |
+| `docs/browser-preview/` | the try-out page source (`index.html` + `README.md`) |
+| `scripts/smoke_browser_preview.py` | smoke test for the browser preview (static + optional 1 live call) |
 | `fixtures/openminion-issue-778.json` | real public issue snapshot (openminion/openminion#778) + repo labels |
 | `scripts/demo.sh` | one-command demo on the fixture (2 real model calls, ~2 min) |
+| `demo-video/issue-triage-demo.mp4` | demo video (1:05, real run output, re-rendered after the audit fixes) |
 | `docs/BUILDING_BLOCKS_TESTED.md` | probe results (auto-generated) |
 | `docs/WHAT_WE_LEARNED.md` | reproduced findings only |
 | `SPIKE.md`, `probe_*.py` | pre-implementation spike: SDK + Pollinations verification |
@@ -205,3 +267,8 @@ metrics.
   execute — it prints commands instead. This is by design (fail-closed).
 - `eval` ground truth is maintainer labels, which are noisy: an issue can
   carry `bug` + `enhancement` at once (counted as ambiguous and skipped).
+- SDK `Agent.run` cannot do the classify step on the free tier (no
+  `response_format` support; the model invents JSON field names and a
+  follow-up returns all nulls). `--via-sdk` runs only the draft through
+  the SDK and falls back to the direct draft when the turn fails — the
+  failure is printed, never hidden.

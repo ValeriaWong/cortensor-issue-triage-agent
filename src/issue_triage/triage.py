@@ -25,6 +25,7 @@ from typing import Any
 
 from pydantic import ValidationError
 
+from .config import ProviderSettings
 from .github_client import GitHubClient, label_names, linked_pr_numbers
 from .llm_client import DirectClient, VerdictParseError
 from .memory import RepoMemory
@@ -142,6 +143,10 @@ class IssueContext:
     existing_labels: list[str] = field(default_factory=list)
     comments: list[dict[str, str]] = field(default_factory=list)
     linked_prs: list[int] = field(default_factory=list)
+    # Fetched PR summaries (number/title/body/state) — empty when the PRs
+    # were not fetched (eval mode, or no linked PRs). Numbers alone are in
+    # linked_prs; details are real evidence for the classifier.
+    linked_pr_details: list[dict[str, Any]] = field(default_factory=list)
     repo_labels: list[str] = field(default_factory=list)
     codeowners: list[tuple[str, list[str]]] = field(default_factory=list)
     contributors: list[str] = field(default_factory=list)
@@ -201,7 +206,8 @@ class TriageEngine:
         return cache
 
     def fetch_context(
-        self, repo: str, number: int, repo_cache: dict[str, Any] | None = None
+        self, repo: str, number: int, repo_cache: dict[str, Any] | None = None,
+        fetch_linked_prs: bool = True,
     ) -> IssueContext:
         issue = self.github.get_issue(repo, number)
         comments_raw = self.github.list_comments(repo, number, per_page=MAX_COMMENTS)
@@ -209,6 +215,20 @@ class TriageEngine:
         if repo_cache is None:
             repo_cache = self.fetch_repo_cache(repo)
         history = self.memory.lookup(repo, limit=5)
+        linked = linked_pr_numbers(timeline)
+        # Linked PR titles/bodies are real evidence for the classifier;
+        # numbers alone say nothing. Capped at 2 (unauthenticated GitHub
+        # allows 60 req/hour; a triage already uses ~6). Eval passes False
+        # to keep its prompt identical to the baseline run.
+        linked_details: list[dict[str, Any]] = []
+        if fetch_linked_prs:
+            for pr_number in linked[:2]:
+                try:
+                    summary = self.github.get_pull_summary(repo, pr_number)
+                except Exception:
+                    summary = None
+                if summary:
+                    linked_details.append(summary)
         return IssueContext(
             repo=repo,
             number=number,
@@ -224,7 +244,8 @@ class TriageEngine:
                 }
                 for c in comments_raw
             ],
-            linked_prs=linked_pr_numbers(timeline),
+            linked_prs=linked,
+            linked_pr_details=linked_details,
             repo_labels=repo_cache.get("repo_labels") or [],
             codeowners=repo_cache.get("codeowners") or [],
             contributors=repo_cache.get("contributors") or [],
@@ -258,7 +279,7 @@ class TriageEngine:
 
     # -- prompts --------------------------------------------------------
     def _classifier_messages(
-        self, ctx: IssueContext, slim: bool = False
+        self, ctx: IssueContext, slim: bool = False, hide_existing_labels: bool = False
     ) -> list[dict[str, str]]:
         history_lines = []
         for d in ctx.history:
@@ -273,6 +294,30 @@ class TriageEngine:
         comments = "\n".join(
             f"- @{c['author']}: {c['body']}" for c in ctx.comments
         ) or "(no comments)"
+        # Label-blind mode (evaluation): the issue's existing maintainer
+        # labels are the ground truth being scored, so they must not reach
+        # the model — otherwise the accuracy measures label-copying, not
+        # classification. The repo label list stays: it is the closed
+        # vocabulary the model must choose from, not the answer.
+        if hide_existing_labels:
+            existing_line = (
+                "Existing labels: (hidden — evaluation mode; "
+                "classify from the issue text only)"
+            )
+        else:
+            existing_line = (
+                f"Existing labels: {', '.join(ctx.existing_labels) or '(none)'}"
+            )
+        if ctx.linked_pr_details:
+            linked_prs_text = "\n".join(
+                f"- #{p['number']} [{p.get('state', '')}]: {p.get('title', '')} — "
+                f"{truncate(p.get('body') or '', 400)}"
+                for p in ctx.linked_pr_details
+            )
+        else:
+            linked_prs_text = (
+                ', '.join(f'#{n}' for n in ctx.linked_prs) or '(none)'
+            )
         if slim:
             # minimal prompt for the retry after an output_token_limit error:
             # short body, no comments / history / CODEOWNERS
@@ -281,7 +326,7 @@ class TriageEngine:
                 f"Issue #{ctx.number} [{ctx.state}] by @{ctx.author}\n"
                 f"Title: {ctx.title}\n"
                 f"Body:\n{truncate(ctx.body, 1200)}\n\n"
-                f"Existing labels: {', '.join(ctx.existing_labels) or '(none)'}\n"
+                f"{existing_line}\n"
                 f"Repository labels (only these may be suggested): "
                 f"{', '.join(ctx.repo_labels[:80]) or '(unknown — suggest none)'}\n\n"
                 "Classify this issue. Reply with exactly one short JSON object."
@@ -295,10 +340,10 @@ class TriageEngine:
             f"Issue #{ctx.number} [{ctx.state}] by @{ctx.author}\n"
             f"Title: {ctx.title}\n"
             f"Body:\n{truncate(ctx.body, MAX_BODY_CHARS)}\n\n"
-            f"Existing labels: {', '.join(ctx.existing_labels) or '(none)'}\n"
+            f"{existing_line}\n"
             f"Repository labels (only these may be suggested): "
             f"{', '.join(ctx.repo_labels[:80]) or '(unknown — suggest none)'}\n"
-            f"Linked PRs: {', '.join(f'#{n}' for n in ctx.linked_prs) or '(none)'}\n"
+            f"Linked PRs:\n{linked_prs_text}\n"
             f"Comments:\n{comments}\n\n"
             f"CODEOWNERS (component -> owners):\n"
             + ("\n".join(codeowner_lines) or "(none)")
@@ -332,13 +377,17 @@ class TriageEngine:
         ]
 
     # -- steps ----------------------------------------------------------
-    def classify(self, ctx: IssueContext) -> tuple[TriageVerdict, dict[str, Any]]:
+    def classify(
+        self, ctx: IssueContext, hide_existing_labels: bool = False
+    ) -> tuple[TriageVerdict, dict[str, Any]]:
         """One model call (tool_calls channel preferred, text JSON fallback).
         On a validation failure, one correction retry with the error quoted.
         On a provider error (e.g. 400 output_token_limit_exceeded — the free
         model sometimes burns its output budget on reasoning), one retry
-        with a slimmed prompt."""
-        messages = self._classifier_messages(ctx)
+        with a slimmed prompt. ``hide_existing_labels`` is the evaluation
+        mode: the issue's maintainer labels (the ground truth) are kept
+        out of the prompt; it changes nothing else."""
+        messages = self._classifier_messages(ctx, hide_existing_labels=hide_existing_labels)
         tools = [verdict_tool_schema()]
         try:
             verdict, result = self.llm.chat_typed(
@@ -362,7 +411,9 @@ class TriageEngine:
         except RuntimeError:
             # provider-side failure: retry once on a slim prompt (less to reason over)
             verdict, result = self.llm.chat_typed(
-                self._classifier_messages(ctx, slim=True),
+                self._classifier_messages(
+                    ctx, slim=True, hide_existing_labels=hide_existing_labels
+                ),
                 TriageVerdict,
                 tools=tools,
                 response_format_json=True,
@@ -439,11 +490,41 @@ class TriageEngine:
             "usage": result.usage,
         }
 
-    def run(self, ctx: IssueContext) -> dict[str, Any]:
-        """Full single-issue deep triage: classify + draft + record (proposed)."""
+    def run(
+        self,
+        ctx: IssueContext,
+        via_sdk: bool = False,
+        provider: ProviderSettings | None = None,
+    ) -> dict[str, Any]:
+        """Full single-issue deep triage: classify + draft + record (proposed).
+
+        Classify always uses the paced DirectClient: the SDK has no
+        ``response_format`` support, so the free model free-forms its
+        classify JSON (invented field names, all-null follow-ups — measured
+        2026-11-17, see :mod:`issue_triage.sdk_triage`). With ``via_sdk``
+        the *draft* step runs through a real OpenMinion ``Agent.run`` turn;
+        if that turn yields no usable draft, fall back to the DirectClient
+        draft and record the fallback in ``draft_via`` / ``draft_meta``.
+        """
         started = time.monotonic()
         verdict, classify_meta = self.classify(ctx)
-        draft_obj, draft_meta = self.draft(ctx, verdict)
+        draft_via = "direct"
+        if via_sdk and provider is not None:
+            from .sdk_triage import run_sdk_draft
+
+            messages = self._drafter_messages(ctx, verdict)
+            sdk_draft, sdk_meta = run_sdk_draft(
+                messages[0]["content"], messages[1]["content"], provider
+            )
+            if sdk_draft is not None:
+                draft_obj, draft_meta = sdk_draft, sdk_meta
+                draft_via = "sdk-native"
+            else:
+                draft_obj, draft_meta = self.draft(ctx, verdict)
+                draft_meta = {**draft_meta, "sdk_error": sdk_meta.get("error")}
+                draft_via = "direct (sdk fallback)"
+        else:
+            draft_obj, draft_meta = self.draft(ctx, verdict)
         self.memory.record(
             TriageDecision(
                 repo=ctx.repo,
@@ -467,6 +548,8 @@ class TriageEngine:
             "draft": draft_obj,
             "classify_meta": classify_meta,
             "draft_meta": draft_meta,
+            "classify_via": "direct",
+            "draft_via": draft_via,
             "total_ms": int((time.monotonic() - started) * 1000),
             "llm_calls": self.llm.calls_made,
         }

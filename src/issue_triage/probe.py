@@ -31,6 +31,7 @@ PROBE_NAMES = [
     "runtime_isolation",
     "structured_pydantic_output",
     "tool_and_forced_tools",
+    "sdk_native_draft",
     "policy_confirmation_gate",
     "session_continuity_isolation",
     "memory_bundle_portability",
@@ -245,6 +246,77 @@ def probe_tool_calls(client: DirectClient, provider: ProviderSettings) -> ProbeR
         duration_ms=int((time.monotonic() - started) * 1000),
         evidence=f"{direct_evidence}. SDK native forced_tools: {sdk_evidence}",
         detail=detail,
+    )
+
+
+def probe_sdk_native_draft(provider: ProviderSettings, fixture_issue: dict | None) -> ProbeResult:
+    """Draft step through a real OpenMinion ``Agent.run`` turn.
+
+    Unlike the typed classify attempt in ``probe_tool_calls`` (which fails
+    on the free tier because the SDK has no ``response_format`` support and
+    the model free-forms its JSON), the draft step works: ``Agent.run``
+    with ``output_type=None`` returns the raw reply and
+    :func:`issue_triage.sdk_triage.parse_sdk_draft` understands the SDK's
+    internal ``{"answer": ...}`` envelope. A ``partial`` here means the
+    turn failed or returned no usable draft on this run — the production
+    path then falls back to the direct draft, so a partial is an honest
+    free-tier outcome, not a code failure.
+    """
+    from .sdk_triage import run_sdk_draft
+    from .triage import TriageEngine
+
+    started = time.monotonic()
+    if not fixture_issue:
+        return ProbeResult(
+            name="sdk_native_draft",
+            status="partial",
+            duration_ms=int((time.monotonic() - started) * 1000),
+            evidence="no fixture issue supplied; nothing to draft from",
+        )
+    ctx = TriageEngine.context_from_fixture("openminion/openminion", fixture_issue)
+    verdict = TriageVerdict(
+        issue_type="bug", severity="high", component="brain",
+        suggested_labels=["area:brain", "bug", "status:maintainer-investigation"],
+        assignee=None, route="needs-maintainer", confidence=0.80,
+        rationale="The issue describes a functional defect in the brain "
+                  "module's closure logic, with evidence from measurements "
+                  "and code references.",
+    )
+    engine = TriageEngine.__new__(TriageEngine)
+    messages = engine._drafter_messages(ctx, verdict)
+    draft, meta = run_sdk_draft(
+        messages[0]["content"], messages[1]["content"], provider
+    )
+    seconds = meta["latency_ms"] / 1000
+    if draft is not None:
+        return ProbeResult(
+            name="sdk_native_draft",
+            status="pass",
+            duration_ms=meta["latency_ms"],
+            evidence=f"Agent.run (output_type=None) returned a usable draft "
+                     f"in {seconds:.1f} s (shape={meta['shape']}, "
+                     f"{len(draft.draft)} chars): {draft.draft[:100]!r}",
+            detail="The draft step demonstrably executes through OpenMinion "
+                   "Agent.run on the Pollinations free tier. The raw reply "
+                   "arrives prefixed with 'triage: ' and wrapped in the "
+                   "SDK's internal {\"answer\": ...} envelope; both are "
+                   "stripped at the app level (see sdk_triage.py). The "
+                   "classify step still cannot run through the SDK on this "
+                   "tier (no response_format support; the model invents its "
+                   "own JSON field names) and stays on the paced direct "
+                   "client. See docs/WHAT_WE_LEARNED.md §4.",
+        )
+    return ProbeResult(
+        name="sdk_native_draft",
+        status="partial",
+        duration_ms=meta["latency_ms"],
+        evidence=f"Agent.run draft turn produced no usable draft in "
+                 f"{seconds:.1f} s: {meta.get('error', 'empty reply')}; "
+                 f"raw head: {(meta.get('raw_head') or '')[:120]!r}",
+        detail="On this run the SDK-native draft turn failed (free-tier 402 "
+               "or an unusable reply). The production path falls back to "
+               "the direct draft, so triage still completes; the SDK path "
+               "is best-effort on this tier. See docs/WHAT_WE_LEARNED.md §4.",
     )
 
 
@@ -614,6 +686,12 @@ def _run_one(
             if not offline
             else ProbeResult(name, "partial", 0, "skipped: offline mode, no model call")
         )
+    if name == "sdk_native_draft":
+        return (
+            probe_sdk_native_draft(provider, fixture_issue)
+            if not offline
+            else ProbeResult(name, "partial", 0, "skipped: offline mode, no model call")
+        )
     if name == "policy_confirmation_gate":
         return probe_approval_gate()
     if name == "session_continuity_isolation":
@@ -677,16 +755,23 @@ def render_building_blocks_md(results: list[ProbeResult], provider: ProviderSett
         "### Honest limitation",
         "",
         "The SDK-native `Agent.run` path against the Pollinations free tier is "
-        "unreliable in two different ways. Usually it fails with HTTP 402 "
-        "(`1 reply every 45 seconds per IP`): one native turn fires several "
-        "consecutive model calls, the first consumes the quota, and the SDK's "
-        "hardcoded 300 ms retry backoff cannot wait out a 45 s window. On the "
-        "rare run where the turn survives the rate limit, the reply may still "
-        "be prose (observed in full-probe runs on 2026-11-16) instead "
-        "of structured output, and fail Pydantic validation. Probes that need "
-        "a live native turn are therefore marked `partial`/`fail` with the "
-        "actual reason, and the production path uses the direct HTTP client "
-        "(one call per step, paced ≥45 s). See `docs/WHAT_WE_LEARNED.md`.",
+        "unreliable for **structured** work, and reliable enough for **prose** "
+        "work. Usually a turn fails with HTTP 402 (`1 reply every 45 seconds "
+        "per IP`): one native turn fires several consecutive model calls, the "
+        "first consumes the quota, and the SDK's hardcoded 300 ms retry "
+        "backoff cannot wait out a 45 s window. When a turn survives the rate "
+        "limit, the free model still free-forms its JSON — for classify it "
+        "invents its own field names (`issue_id` / `status` / "
+        "`classification`) and a same-session follow-up returns all nulls — "
+        "because the SDK has no `response_format` / `json_object` support. "
+        "The classify step therefore stays on the direct HTTP client (one "
+        "call per step, paced ≥45 s, tool_calls + `response_format` "
+        "`json_object`). The **draft** step does run through `Agent.run` "
+        "(`output_type=None`, raw reply parsed at the app level — the reply "
+        "arrives as `triage: {\"answer\": ...}` and the `answer` field is the "
+        "draft); see the `sdk_native_draft` probe. A failed SDK draft turn "
+        "falls back to the direct draft, so triage still completes. "
+        "See `docs/WHAT_WE_LEARNED.md` §4.",
         "",
     ]
     return "\n".join(lines)

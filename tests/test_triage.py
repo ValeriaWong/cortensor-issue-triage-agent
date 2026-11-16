@@ -44,8 +44,61 @@ def test_fetch_context_from_stub_github(llm_client, github_client, tmp_path):
     assert ctx.title.startswith("brain:")
     assert ctx.existing_labels == ["bug", "area:brain"]
     assert ctx.linked_prs == [770]
+    assert ctx.linked_pr_details == [
+        {"number": 770, "title": "Fix brain completion gating",
+         "body": "This PR gates completion on verification.",
+         "state": "open", "merged": False}
+    ]
     assert ctx.comments[0]["author"] == "maintainer"
     assert ctx.contributors == ["alice", "bob"]
+
+
+def test_fetch_context_without_pr_fetch_leaves_details_empty(
+    llm_client, github_client, tmp_path
+):
+    # eval mode: no PR bodies, prompt stays comparable to the baseline run
+    engine = _engine(llm_client, github_client, tmp_path)
+    ctx = engine.fetch_context("openminion/openminion", 778, fetch_linked_prs=False)
+    assert ctx.linked_prs == [770]
+    assert ctx.linked_pr_details == []
+
+
+def _existing_labels_line(messages):
+    user = messages[1]["content"]
+    return [ln for ln in user.splitlines() if ln.startswith("Existing labels:")]
+
+
+def test_classifier_prompt_blind_hides_existing_labels(
+    llm_client, github_client, tmp_path
+):
+    engine = _engine(llm_client, github_client, tmp_path)
+    ctx = engine.fetch_context("openminion/openminion", 778)
+    line = _existing_labels_line(
+        engine._classifier_messages(ctx, hide_existing_labels=True)
+    )
+    assert line == [
+        "Existing labels: (hidden — evaluation mode; "
+        "classify from the issue text only)"
+    ]
+
+
+def test_classifier_prompt_aware_shows_existing_labels(
+    llm_client, github_client, tmp_path
+):
+    engine = _engine(llm_client, github_client, tmp_path)
+    ctx = engine.fetch_context("openminion/openminion", 778)
+    line = _existing_labels_line(engine._classifier_messages(ctx))
+    assert line == ["Existing labels: bug, area:brain"]
+
+
+def test_classifier_prompt_includes_linked_pr_body(
+    llm_client, github_client, tmp_path
+):
+    engine = _engine(llm_client, github_client, tmp_path)
+    ctx = engine.fetch_context("openminion/openminion", 778)
+    user = engine._classifier_messages(ctx)[1]["content"]
+    assert "Fix brain completion gating" in user
+    assert "gates completion on verification" in user
 
 
 def test_classify_end_to_end_stub(llm_client, github_client, tmp_path):

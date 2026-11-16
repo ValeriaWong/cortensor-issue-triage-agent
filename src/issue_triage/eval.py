@@ -6,6 +6,15 @@ per-class precision / recall / F1 plus a confidence-calibration summary.
 No draft call is made during eval (that would double the cost for no
 classification signal).
 
+Two modes (see ``run_eval`` ``blind``):
+
+- **label-blind (default, honest):** the issue's existing maintainer
+  labels are hidden from the classifier prompt — they are the ground
+  truth being scored, so showing them measures label-copying, not
+  classification. The repo label list stays (closed vocabulary).
+- **label-aware (``--label-aware``):** the original mode, kept only as a
+  baseline. The 2026-11-16 run (accuracy 0.9, 9/10) was label-aware.
+
 Ground-truth mapping is deliberately conservative: only issues whose
 maintainer labels map to exactly one type count.
 """
@@ -98,8 +107,15 @@ def run_eval(
     repo: str,
     limit: int,
     issues: list[dict] | None = None,
+    blind: bool = True,
 ) -> dict:
-    """Run eval. ``issues`` overrides the GitHub fetch (tests / offline)."""
+    """Run eval. ``issues`` overrides the GitHub fetch (tests / offline).
+    ``blind`` (default True) hides each issue's existing maintainer labels
+    from the classifier prompt — they are the ground truth, so showing
+    them would score label-copying instead of classification. Linked PR
+    bodies are not fetched in eval: the prompt must match the baseline
+    run except for the hidden labels, and a 10-issue eval already uses
+    ~60 unauthenticated GitHub requests."""
     if issues is None:
         raw = engine.github.list_issues(repo, state="all", per_page=max(limit * 3, 30))
         issues = [i for i in raw if "pull_request" not in i]
@@ -116,9 +132,11 @@ def run_eval(
             skipped += 1
             continue
         try:
-            ctx = engine.fetch_context(repo, issue["number"], repo_cache=repo_cache)
+            ctx = engine.fetch_context(
+                repo, issue["number"], repo_cache=repo_cache, fetch_linked_prs=False
+            )
             started = time.monotonic()
-            verdict, meta = engine.classify(ctx)
+            verdict, meta = engine.classify(ctx, hide_existing_labels=blind)
             latency_ms = int((time.monotonic() - started) * 1000)
         except Exception as exc:  # noqa: BLE001 - per-issue resilience
             errors.append(
@@ -148,6 +166,7 @@ def run_eval(
     return {
         "repo": repo,
         "limit": limit,
+        "mode": "label-blind" if blind else "label-aware",
         "skipped_unlabelled_or_ambiguous": skipped,
         "records": [r.model_dump() for r in records],
         "errors": errors,

@@ -106,6 +106,12 @@ def github_stub_handler():
                     {"event": "commented"},
                 ],
             )
+        if path.endswith("/pulls/770"):
+            return httpx.Response(200, json={
+                "number": 770, "title": "Fix brain completion gating",
+                "body": "This PR gates completion on verification.",
+                "state": "open", "merged": False,
+            })
         if path.endswith("/labels"):
             return httpx.Response(200, json=[{"name": n} for n in REPO_LABELS])
         if path.endswith("/contributors"):
