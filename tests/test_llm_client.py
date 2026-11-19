@@ -53,6 +53,17 @@ def test_parse_typed_rejects_illegal_enum():
                     TriageVerdict)
 
 
+def test_parse_typed_normalises_enum_synonym():
+    # "enhancement" is a real GitHub label; the model answers it for a
+    # feature request — the verdict must map it, not fail validation
+    verdict = parse_typed(
+        '{"issue_type": "enhancement", "severity": "high", "component": "x",'
+        ' "route": "ready-to-fix", "confidence": 0.9, "rationale": "x"}',
+        TriageVerdict,
+    )
+    assert verdict.issue_type == "feature"
+
+
 def test_tool_calls_channel_preferred(llm_client):
     verdict, result = llm_client.chat_typed(
         [{"role": "user", "content": "x"}],

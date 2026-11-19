@@ -58,3 +58,32 @@ def test_draft_requires_text():
     with pytest.raises(ValidationError):
         TriageDraft.model_validate({})
     assert TriageDraft.model_validate({"draft": "hi"}).draft == "hi"
+
+
+def test_synonym_enhancement_maps_to_feature():
+    # the 2026-11-16 eval lost #767 this way: the model answered
+    # "enhancement" (a real GitHub label) for a feature request
+    assert TriageVerdict.model_validate({**BASE, "issue_type": "enhancement"}).issue_type == "feature"
+
+
+def test_synonym_variants_normalised():
+    assert TriageVerdict.model_validate({**BASE, "issue_type": "Enhancement"}).issue_type == "feature"
+    assert TriageVerdict.model_validate({**BASE, "issue_type": "feature_request"}).issue_type == "feature"
+    assert TriageVerdict.model_validate({**BASE, "issue_type": "bug report"}).issue_type == "bug"
+    assert TriageVerdict.model_validate({**BASE, "issue_type": "documentation"}).issue_type == "docs"
+    assert TriageVerdict.model_validate({**BASE, "issue_type": "doc"}).issue_type == "docs"
+    assert TriageVerdict.model_validate({**BASE, "severity": "blocker"}).severity == "critical"
+    assert TriageVerdict.model_validate({**BASE, "severity": "minor"}).severity == "low"
+    assert TriageVerdict.model_validate({**BASE, "route": "needs_info"}).route == "needs-info"
+    assert TriageVerdict.model_validate({**BASE, "route": "Ready To Fix"}).route == "ready-to-fix"
+
+
+def test_unknown_enum_still_rejected_after_normalisation():
+    with pytest.raises(ValidationError):
+        TriageVerdict.model_validate({**BASE, "issue_type": "failure"})
+    with pytest.raises(ValidationError):
+        TriageVerdict.model_validate({**BASE, "issue_type": "wontfix"})
+    with pytest.raises(ValidationError):
+        TriageVerdict.model_validate({**BASE, "severity": "urgent"})
+    with pytest.raises(ValidationError):
+        TriageVerdict.model_validate({**BASE, "route": "ship-it"})

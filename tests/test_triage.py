@@ -140,6 +140,50 @@ def test_run_records_proposed_decision(llm_client, github_client, tmp_path):
     assert decisions[0].status == "proposed"
 
 
+def test_classify_400_falls_back_to_plain_text_shape(clock, github_client, tmp_path):
+    """The `<|constrain|>commentary` 400 (eval #777/#773): the retry must
+    change the request shape — a same-shape slim retry already failed
+    once per issue, so repeating it cannot recover."""
+    import httpx
+
+    from issue_triage.llm_client import DirectClient
+    from tests.conftest import VERDICT_ARGS
+
+    seen: list[dict] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        payload = json.loads(request.content.decode())
+        seen.append(payload)
+        if payload.get("tools") or payload.get("response_format"):
+            return httpx.Response(
+                400,
+                text='{"success":false,"error":{"message":"400 Bad Request: '
+                'unexpected tokens remaining in message header: '
+                'Some(\\"<|constrain|>commentary\\")","code":"BAD_REQUEST"}}',
+            )
+        return httpx.Response(200, json={
+            "model": "stub",
+            "choices": [{"message": {"role": "assistant",
+                                     "content": json.dumps(VERDICT_ARGS)},
+                         "finish_reason": "stop"}],
+            "usage": {},
+        })
+
+    client = DirectClient(
+        base_url="https://stub.invalid", model="stub", min_interval_sec=0,
+        transport=httpx.MockTransport(handler),
+        sleep=clock.sleep, clock=clock.time,
+    )
+    engine = _engine(client, github_client, tmp_path)
+    ctx = engine.fetch_context("openminion/openminion", 778)
+    verdict, meta = engine.classify(ctx)
+    assert verdict.issue_type == "bug"
+    assert meta["slim_retry"] is True
+    assert len(seen) == 2
+    assert "tools" not in seen[1] and "response_format" not in seen[1]
+    client.close()
+
+
 def test_context_from_fixture(tmp_path):
     raw = json.loads(open("fixtures/openminion-issue-778.json").read())
     ctx = TriageEngine.context_from_fixture("openminion/openminion", raw)

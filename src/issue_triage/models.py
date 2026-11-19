@@ -10,9 +10,10 @@ are validated against the repo's real label set in :mod:`issue_triage.triage`.
 from __future__ import annotations
 
 from datetime import datetime, timezone
-from typing import Literal
+import re
+from typing import Any, Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 IssueType = Literal["bug", "feature", "question", "docs", "chore", "duplicate"]
 Severity = Literal["critical", "high", "medium", "low"]
@@ -38,9 +39,70 @@ ROUTES: tuple[str, ...] = (
     "needs-discussion",
 )
 
+# Synonyms the free model returns for the closed enum values, keyed by the
+# normalised form (lowercase, spaces/underscores collapsed to "-").
+# The model answers "enhancement" for a feature request — a real GitHub
+# label — and "documentation" for docs; rejecting those loses the whole
+# verdict, while the mapping is unambiguous. Anything not in the map and
+# not a valid value still fails validation loudly (see test_models.py).
+ENUM_SYNONYMS: dict[str, dict[str, str]] = {
+    "issue_type": {
+        "enhancement": "feature",
+        "feature-request": "feature",
+        "new-feature": "feature",
+        "bug-report": "bug",
+        "defect": "bug",
+        "documentation": "docs",
+        "doc": "docs",
+        "help": "question",
+        "support": "question",
+    },
+    "severity": {
+        "blocker": "critical",
+        "major": "high",
+        "high-priority": "high",
+        "minor": "low",
+        "trivial": "low",
+        "low-priority": "low",
+    },
+    "route": {},
+}
+
+
+def normalize_enum_value(value: Any, field: str) -> Any:
+    """Normalise one enum-like value: lowercase, collapse spaces and
+    underscores to "-", then apply the synonym map for that field.
+    Non-strings pass through untouched (Pydantic reports them)."""
+    if not isinstance(value, str):
+        return value
+    key = re.sub(r"[\s_]+", "-", value.strip().lower())
+    return ENUM_SYNONYMS.get(field, {}).get(key, key)
+
+
+def normalize_verdict_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    """Normalise the enum fields of a raw verdict payload before
+    Pydantic validation. Returns a copy; unknown values are left alone
+    so validation still rejects them."""
+    out = dict(payload)
+    for field in ("issue_type", "severity", "route"):
+        if field in out:
+            out[field] = normalize_enum_value(out[field], field)
+    return out
+
 
 class TriageVerdict(BaseModel):
     """The single-issue deep-triage verdict. Produced by the classifier call."""
+
+    @model_validator(mode="before")
+    @classmethod
+    def _normalize_enums(cls, data: Any) -> Any:
+        # The free model returns maintainer-label synonyms ("enhancement")
+        # and formatting variants ("needs_info", "Bug Report"); map them
+        # to the closed enums before validation so one synonym does not
+        # lose the whole verdict. Unknown values still fail loudly.
+        if isinstance(data, dict):
+            return normalize_verdict_payload(data)
+        return data
 
     issue_type: IssueType
     severity: Severity

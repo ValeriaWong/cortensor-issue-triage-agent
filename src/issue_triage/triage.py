@@ -383,10 +383,13 @@ class TriageEngine:
         """One model call (tool_calls channel preferred, text JSON fallback).
         On a validation failure, one correction retry with the error quoted.
         On a provider error (e.g. 400 output_token_limit_exceeded — the free
-        model sometimes burns its output budget on reasoning), one retry
-        with a slimmed prompt. ``hide_existing_labels`` is the evaluation
-        mode: the issue's maintainer labels (the ground truth) are kept
-        out of the prompt; it changes nothing else."""
+        model sometimes burns its output budget on reasoning — or the
+        `<|constrain|>commentary` 400), one retry with a slimmed prompt in
+        a *different request shape* (plain text, no tools, no json_object):
+        the upstream caches the constrained-decoding 400 verbatim, so
+        re-sending the same shape cannot recover. ``hide_existing_labels``
+        is the evaluation mode: the issue's maintainer labels (the ground
+        truth) are kept out of the prompt; it changes nothing else."""
         messages = self._classifier_messages(ctx, hide_existing_labels=hide_existing_labels)
         tools = [verdict_tool_schema()]
         try:
@@ -409,14 +412,42 @@ class TriageEngine:
                 correction, TriageVerdict, tools=tools, response_format_json=True
             )
         except RuntimeError:
-            # provider-side failure: retry once on a slim prompt (less to reason over)
+            # provider-side failure: retry once with a *different request
+            # shape* (slim prompt, plain text, no tools, no json_object).
+            # The `<|constrain|>commentary` HTTP 400 is a constrained-
+            # decoding upstream glitch: the upstream caches that exact 400
+            # for minutes, so re-sending the identical constrained request
+            # cannot recover — verified on #777/#773 in the 2026-11-16
+            # eval, where the slim-prompt retry with the same shape failed
+            # too. Changing the shape gets a fresh cache key and bypasses
+            # constrained decoding entirely; the draft step already uses
+            # this fallback for the same error class. The JSON shape is
+            # spelled out in the message because, without a tool schema,
+            # the model invents key names.
+            retry_messages = self._classifier_messages(
+                ctx, slim=True, hide_existing_labels=hide_existing_labels
+            ) + [
+                {
+                    "role": "user",
+                    "content": (
+                        "Your previous reply could not be delivered. Reply "
+                        "again with exactly one JSON object and no other "
+                        "text, using exactly these keys: issue_type (one "
+                        "of bug, feature, question, docs, chore, "
+                        "duplicate), severity (one of critical, high, "
+                        "medium, low), component (string), suggested_labels "
+                        "(array of strings, only from the repository label "
+                        "list), assignee (a login or null), route (one of "
+                        "needs-maintainer, needs-info, good-first-issue, "
+                        "ready-to-fix, docs-queue, close-as-duplicate, "
+                        "needs-discussion), confidence (number 0-1), "
+                        "rationale (string), evidence (array of strings), "
+                        "duplicate_of (an issue number or null)."
+                    ),
+                }
+            ]
             verdict, result = self.llm.chat_typed(
-                self._classifier_messages(
-                    ctx, slim=True, hide_existing_labels=hide_existing_labels
-                ),
-                TriageVerdict,
-                tools=tools,
-                response_format_json=True,
+                retry_messages, TriageVerdict, tools=None, response_format_json=False
             )
             return self._finalise_verdict(ctx, verdict, result, slim_retry=True)
         return self._finalise_verdict(ctx, verdict, result)
