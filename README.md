@@ -205,6 +205,43 @@ retry; #767: the model answered `enhancement` as the issue type, which
 is not a valid enum value). #778 blind: bug, confidence 0.90
 (label-aware: 0.80).
 
+Re-run with the fixes, 2026-11-19, the same 13 issues (10 scored + 3
+previously errored), Pollinations `gpt-oss-20b`, $0 — evidence in
+`eval/results-20261119-1525.json` (13 model calls, no retries):
+**accuracy 0.923 (12/13), 0 errors.** All three previously errored
+issues now score and are correct (#777 feature, #773 bug, #767 feature
+— the last via the new enum-synonym map). The single miss is #774
+(predicted bug, truth feature, confidence 0.85), which was correct in
+the 2026-11-17 blind run — a nondeterministic flip, not a regression.
+Per-class: bug P 0.9 / R 1.0 (support 9), feature P 1.0 / R 0.75
+(support 4). The headline moved from 1.0 (n=10) to 0.923 (n=13)
+because the excluded hard cases now score; the set got harder, not
+the classifier worse. Note: the submitted DoraHacks Build 1
+description still says label-blind 10/10 — that was the 2026-11-17
+number on the 10-issue scored set; the repo now reports 12/13 on the
+full 13-issue set.
+
+Expansion, 2026-11-19, continuing the newest-first scan below 754
+(selection rule: the first issues with unambiguous ground truth; 20
+skipped as unlabelled/ambiguous across the two runs, counted not
+hand-picked), Pollinations `gpt-oss-20b`, $0 — evidence in
+`eval/results-20261119-1541.json` (7 issues: 752, 751, 745, 720, 719,
+718, 717) and `eval/results-20261119-1551.json` (3 issues: 663, 661,
+660; page 2 of the issues list, below 717): **expansion accuracy
+0.571 (4/7)** on the first batch and **1.0 (3/3)** on the top-up,
+**0 errors in either**. Combined with the re-run: **n=23, accuracy
+0.826 (19/23), 0 errors**. Per-class combined: bug P 0.8 / R 1.0
+(support 16), feature P 1.0 / R 0.75 (support 4), question P 0 / R 0
+(support 2), docs P 0 / R 0 (support 1). The failure mode is uniform:
+all 4 misses are false-positive bugs — a feature request (#774), a
+docs issue (#745), and two questions (#719, #718) all read as bug
+reports to the classifier. Confidence does not separate right from
+wrong here: mean confidence 0.839 correct vs 0.837 wrong; the ≥0.8
+bucket is 15/18 and 0.5–0.8 is 4/5. The headline to quote is the
+combined one, 19/23, not the 10/10 of the 2026-11-17 blind run (which
+excluded the 3 hard cases) — and the submitted DoraHacks Build 1
+description still says label-blind 10/10.
+
 Run a bigger batch with the same command and a larger `--limit`
 (30 issues ≈ 25 min, 50 ≈ 40 min, paced ≥45 s apart).
 
@@ -229,7 +266,7 @@ backoff and the no-op public `import_bundle()`).
 ## Tests
 
 ```bash
-.venv/bin/python -m pytest -q   # 106 tests, loopback HTTP stubs, zero LLM cost
+.venv/bin/python -m pytest -q   # 113 tests, loopback HTTP stubs, zero LLM cost
 ```
 
 Covers CLI parsing, verdict validation (illegal enum values rejected),
@@ -243,11 +280,12 @@ metrics.
 | Path | What it is |
 |---|---|
 | `src/issue_triage/` | the package (`cli`, `triage`, `sdk_triage`, `llm_client`, `github_client`, `memory`, `approval`, `eval`, `probe`, `config`, `models`) |
-| `tests/` | 106 pytest tests (stubbed, $0) |
+| `tests/` | 113 pytest tests (stubbed, $0) |
 | `docs/browser-preview/` | the try-out page source (`index.html` + `README.md`) |
 | `scripts/smoke_browser_preview.py` | smoke test for the browser preview (static + optional 1 live call) |
 | `fixtures/openminion-issue-778.json` | real public issue snapshot (openminion/openminion#778) + repo labels |
 | `scripts/demo.sh` | one-command demo on the fixture (2 real model calls, ~2 min) |
+| `scripts/run_eval_set.py` | label-blind eval over an explicit set (`--numbers`) or a mechanical continuation scan (`--next-below` / `--page`) |
 | `demo-video/issue-triage-demo.mp4` | demo video (1:05, real run output, re-rendered after the audit fixes) |
 | `docs/BUILDING_BLOCKS_TESTED.md` | probe results (auto-generated) |
 | `docs/WHAT_WE_LEARNED.md` | reproduced findings only |

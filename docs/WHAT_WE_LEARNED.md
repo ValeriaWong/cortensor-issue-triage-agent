@@ -188,6 +188,21 @@ WV629's F1–F13 — those belong to their authors.
   label-blind eval (#777, #773) despite the slim-prompt retry — so it is
   not draft-specific, and a shape-changing retry does not always escape
   it. The eval records those issues as errors and continues.
+- **Update 2026-11-19:** `classify()` now uses the same shape-changing
+  retry as `draft()` (slim prompt, plain text, no tools, no
+  `json_object`) instead of the slim-prompt retry with the same shape,
+  which failed on #777/#773. The 400 did **not** reproduce on demand
+  the same day (a direct call with #777's exact production prompt
+  returned 200 in ~9 s) — the glitch is transient upstream state, and
+  the fallback is justified by the two recorded eval hits, not by a
+  live reproduction. In the 2026-11-19 re-run eval over the same 13
+  issues, #777 and #773 both scored (feature/bug, both correct) with
+  zero provider errors (file `eval/results-20261119-1525.json`); the
+  re-run used 13 calls with no retries, so the fallback never fired
+  there — the live proof that the fallback itself recovers a 400 is
+  still only the stub test in `tests/test_triage.py`, not a live hit.
+  The enum half of the fix *is* live-proven: #767 scored via the new
+  synonym map (see §13).
 - **Source:** `/tmp/probe_full.log` (run 1), `/tmp/probe_full2.log` (run 2,
   two 400s at 17:49:13/17:49:58, same body timestamp), `scripts/ab_reasoning_effort.py`;
   `src/issue_triage/triage.py::draft`, `src/issue_triage/probe.py::run_probes`.
@@ -254,6 +269,44 @@ WV629's F1–F13 — those belong to their authors.
   invalid enum value). #778 blind: bug at confidence 0.90 (label-aware:
   0.80) — the *type* classification holds without the labels; the full
   "labels exactly match the maintainer's" claim stays label-aware-only.
+- **Re-run 2026-11-19 (same 13 issues, fixed code):** accuracy **0.923
+  (12/13)**, 0 errors, 0 skipped (file
+  `eval/results-20261119-1525.json`, 13 model calls, no retries). All
+  three previously errored issues now score and are correct (#777
+  feature, #773 bug, #767 feature — the last via the new synonym map in
+  `models.py`, which normalises maintainer-label synonyms such as
+  `enhancement` → `feature` before Pydantic validation; unknown values
+  still fail loudly). The single miss is #774 (predicted bug, truth
+  feature, confidence 0.85) — it was correct in the 2026-11-17 blind
+  run (feature, 0.60), so this is a nondeterministic flip, not a
+  regression from the fixes. Per-class: bug P 0.9 / R 1.0 (support 9),
+  feature P 1.0 / R 0.75 (support 4). Calibration: mean confidence
+  0.821 correct vs 0.85 wrong — the one miss was high-confidence, so
+  confidence does not separate it here; ≥0.8 bucket 8/9, 0.5–0.8 4/4.
+  Read the headline honestly: 1.0 (n=10) became 0.923 (n=13) because
+  the hard cases that were excluded now score — the set got harder,
+  not the classifier worse.
+- **Expansion 2026-11-19 (10 more issues, same mechanical rule):**
+  newest-first scan below 754 took 7 from page 1 (752, 751, 745, 720,
+  719, 718, 717; 7 skipped unlabelled/ambiguous) and 3 from page 2
+  (663, 661, 660; 13 skipped) — files
+  `eval/results-20261119-1541.json` and
+  `eval/results-20261119-1551.json`, 0 errors in either. First batch
+  0.571 (4/7), top-up 1.0 (3/3). **Combined with the re-run: n=23,
+  accuracy 0.826 (19/23), 0 errors, 20 skipped.** Per-class: bug P
+  0.8 / R 1.0 (support 16), feature P 1.0 / R 0.75 (support 4),
+  question 0/0 (support 2), docs 0/0 (support 1). Failure mode is
+  uniform: all 4 misses are false-positive bugs (#774 feature, #745
+  docs, #719/#718 question) — on the older issues, non-bug reports
+  read as bug reports. Confidence does not separate: mean 0.839
+  correct vs 0.837 wrong; ≥0.8 bucket 15/18, 0.5–0.8 4/5. Two of the
+  misses are ground-truth judgement calls, not pure classifier
+  errors: #719/#718 describe failure behaviour in title and body but
+  the maintainer labelled them questions (the discussion intent is
+  not in the text), while #745's body says "documentation" outright
+  and was still called bug — that one is a genuine miss on a clear
+  signal. Open finding, not yet addressed: the prompt has no
+  docs-vs-bug / question-vs-bug disambiguation.
 - **Source:** `src/issue_triage/triage.py::_classifier_messages`
   (`hide_existing_labels`), `src/issue_triage/eval.py::run_eval`
   (`blind=True` default); `tests/test_triage.py`, `tests/test_eval.py`.
@@ -316,6 +369,19 @@ WV629's F1–F13 — those belong to their authors.
   calls ~1 s apart and needs more than one 200 inside a 45 s window.
   That is why `--via-sdk` is best-effort with a fallback, not the
   default path.
+- **Update 2026-11-19 — one mitigation attempted, still 402:** `run()`
+  now waits out the DirectClient pacing interval before starting the
+  SDK turn, so the turn's first internal call lands in a fresh 45 s
+  window instead of on top of the classify call. Live test the same
+  day (`triage --via-sdk` on the #778 fixture): the turn still failed
+  with HTTP 402 (`Retry after 31s`) and fell back to the direct draft
+  (verdict bug / needs-maintainer / 0.70, snapshot saved pending). The
+  fresh gap does not fix it — the turn needs more than one 200 inside
+  the window, and the free tier allows one. Native SDK turns cannot
+  survive the free tier; `--via-sdk` stays best-effort with fallback,
+  not the default. The wait stays in the code as a best-effort (it can
+  only help the first internal call) with a unit test; it is not
+  claimed as a fix.
 - **Source:** `/tmp/sdk_round2.log`, `/tmp/sdk_round3_classify.json`,
   `/tmp/sdk_round3_draft.json`, `/tmp/sdk_proxy_log.jsonl`;
   `src/issue_triage/sdk_triage.py::strip_sdk_prefix`,
