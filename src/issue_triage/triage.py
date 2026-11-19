@@ -543,6 +543,16 @@ class TriageEngine:
         if via_sdk and provider is not None:
             from .sdk_triage import run_sdk_draft
 
+            # The SDK turn fires several consecutive provider calls inside
+            # a 45 s free-tier window: starting it right after classify
+            # means its first internal call lands inside classify's
+            # window and 402s (CLI runs 2026-11-17: first call 200, then
+            # 9x 402). Wait out the pacing interval first so the turn
+            # starts in a fresh window. Best-effort only: the turn still
+            # needs more than one 200 inside the window, which the free
+            # tier does not allow — see docs/WHAT_WE_LEARNED.md §15.
+            # The fallback below still applies if the turn fails.
+            self.llm.wait_pacing()
             messages = self._drafter_messages(ctx, verdict)
             sdk_draft, sdk_meta = run_sdk_draft(
                 messages[0]["content"], messages[1]["content"], provider

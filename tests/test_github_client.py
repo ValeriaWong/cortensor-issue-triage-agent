@@ -1,5 +1,6 @@
 """GitHub client parsing: issues, comments, timeline, CODEOWNERS, URLs."""
 
+import httpx
 import pytest
 
 from issue_triage.github_client import (
@@ -68,6 +69,22 @@ def test_owners_for_path_last_match_wins():
     assert owners_for_path(entries, "/src/brain/engine.py") == ["bob"]
     assert owners_for_path(entries, "/src/other.py") == ["alice"]
     assert owners_for_path(entries, "/README.md") == []
+
+
+def test_list_issues_page_param():
+    seen = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["page"] = request.url.params.get("page")
+        return httpx.Response(200, json=[{"number": 778}])
+
+    client = GitHubClient(transport=httpx.MockTransport(handler))
+    try:
+        issues = client.list_issues("openminion/openminion", page=2)
+        assert issues[0]["number"] == 778
+        assert seen["page"] == "2"
+    finally:
+        client.close()
 
 
 def test_write_without_token_refused():

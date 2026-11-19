@@ -184,6 +184,32 @@ def test_classify_400_falls_back_to_plain_text_shape(clock, github_client, tmp_p
     client.close()
 
 
+def test_run_via_sdk_waits_for_fresh_window(llm_client, github_client, tmp_path, clock, monkeypatch):
+    """The SDK turn must start in a fresh free-tier window, not on top of
+    the classify call that just ran (CLI runs 2026-11-17: first SDK call
+    200, then 9x 402)."""
+    import issue_triage.sdk_triage as sdk_mod
+    from issue_triage.config import ProviderSettings
+    from issue_triage.models import TriageDraft
+
+    def fake_sdk_draft(system, user, provider, timeout_seconds=240, runner=None):
+        return TriageDraft(draft="sdk draft", tone="neutral"), {
+            "channel": "sdk-native", "latency_ms": 1, "model": "stub", "shape": "prose",
+        }
+
+    monkeypatch.setattr(sdk_mod, "run_sdk_draft", fake_sdk_draft)
+    engine = _engine(llm_client, github_client, tmp_path)
+    ctx = engine.fetch_context("openminion/openminion", 778)
+    provider = ProviderSettings(
+        preset="openai-compatible", base_url="https://stub.invalid",
+        model="stub", api_key="",
+    )
+    result = engine.run(ctx, via_sdk=True, provider=provider)
+    assert result["draft_via"] == "sdk-native"
+    assert result["draft"].draft == "sdk draft"
+    assert 45.0 in clock.slept  # the pacing wait before the SDK turn
+
+
 def test_context_from_fixture(tmp_path):
     raw = json.loads(open("fixtures/openminion-issue-778.json").read())
     ctx = TriageEngine.context_from_fixture("openminion/openminion", raw)

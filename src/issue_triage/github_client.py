@@ -135,12 +135,12 @@ class GitHubClient:
         return [label["name"] for label in resp.json()]
 
     def list_issues(
-        self, repo: str, state: str = "all", per_page: int = 30
+        self, repo: str, state: str = "all", per_page: int = 30, page: int = 1
     ) -> list[dict[str, Any]]:
         owner, name = parse_repo(repo)
         resp = self._client.get(
             f"/repos/{owner}/{name}/issues",
-            params={"state": state, "per_page": per_page, "sort": "created", "direction": "desc"},
+            params={"state": state, "per_page": per_page, "page": page, "sort": "created", "direction": "desc"},
         )
         resp.raise_for_status()
         # The list endpoint mixes pull requests in; callers filter on "pull_request".

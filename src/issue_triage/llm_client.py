@@ -147,6 +147,17 @@ class DirectClient:
         )
 
     # -- pacing ---------------------------------------------------------
+    def wait_pacing(self) -> float:
+        """Block until ``min_interval_sec`` elapsed since the last call ended.
+
+        Public wrapper for :meth:`_wait_pacing`, for callers that make
+        model calls outside this client (the SDK turn in
+        :mod:`issue_triage.triage`): an SDK turn fires several consecutive
+        provider calls, so its first call must start in a fresh free-tier
+        window, not on top of the classify call that just ran.
+        """
+        return self._wait_pacing()
+
     def _wait_pacing(self) -> float:
         """Sleep until ``min_interval_sec`` elapsed since the last call ended."""
         if self._last_call_end is None or self.min_interval_sec <= 0:
