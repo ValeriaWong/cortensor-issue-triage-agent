@@ -216,10 +216,7 @@ the 2026-11-17 blind run — a nondeterministic flip, not a regression.
 Per-class: bug P 0.9 / R 1.0 (support 9), feature P 1.0 / R 0.75
 (support 4). The headline moved from 1.0 (n=10) to 0.923 (n=13)
 because the excluded hard cases now score; the set got harder, not
-the classifier worse. Note: the submitted DoraHacks Build 1
-description still says label-blind 10/10 — that was the 2026-11-17
-number on the 10-issue scored set; the repo now reports 12/13 on the
-full 13-issue set.
+the classifier worse. Note: the submitted DoraHacks Build 1 description now reports the combined 19/23 (updated 2026-11-21); it previously said label-blind 10/10, the 2026-11-17 number on the 10-issue scored set.
 
 Expansion, 2026-11-19, continuing the newest-first scan below 754
 (selection rule: the first issues with unambiguous ground truth; 20
@@ -239,8 +236,7 @@ reports to the classifier. Confidence does not separate right from
 wrong here: mean confidence 0.839 correct vs 0.837 wrong; the ≥0.8
 bucket is 15/18 and 0.5–0.8 is 4/5. The headline to quote is the
 combined one, 19/23, not the 10/10 of the 2026-11-17 blind run (which
-excluded the 3 hard cases) — and the submitted DoraHacks Build 1
-description still says label-blind 10/10.
+excluded the 3 hard cases) — and the submitted DoraHacks Build 1 description now reports 19/23 as well (updated 2026-11-21).
 
 Run a bigger batch with the same command and a larger `--limit`
 (30 issues ≈ 25 min, 50 ≈ 40 min, paced ≥45 s apart).
